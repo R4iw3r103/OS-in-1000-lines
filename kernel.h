@@ -1,11 +1,22 @@
 #pragma once
 #include "common.h"
 
-// __FILE__: エラーが起きたファイル名、__LINE__: 行番号
-// ##__VA_ARGS__: 可変超引数を受け取るマクロを定義するときに使える。空の時に直前の,を削除して辻褄を合わせる
+#define PROCS_MAX 8      // 最大プロセス数
+#define PROC_UNUSED 0    // 未使用のプロセス管理構造体
+#define PROC_RUNNABLE 1  // 実行可能なプロセス
 struct sbiret {
   long error;
   long value;
+};
+
+struct process {
+  int pid;                // プロセスID
+  int state;              // プロセスの状態
+  vaddr_t sp;             // コンテキストスイッチ時のスタックポインタ
+  // カーネルスタック:
+  // コンテキストスイッチ時のCPUレジスタ、関数の戻り先、各関数でのローカル変数などが入っている
+  // これをプロセスごとに用意することで、別の実行コンテキストを持ち、スイッチで状態の保存と復元ができる
+  uint8_t stack[8192];
 };
 
 struct trap_frame {
@@ -57,6 +68,8 @@ struct trap_frame {
     __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp)); \
   } while (0)
 
+// __FILE__: エラーが起きたファイル名、__LINE__: 行番号
+// ##__VA_ARGS__: 可変超引数を受け取るマクロを定義するときに使える。空の時に直前の,を削除して辻褄を合わせる
 #define PANIC(fmt, ...) \
   do { \
     printf("PANIC: %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__); \

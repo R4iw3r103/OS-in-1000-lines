@@ -7,6 +7,7 @@
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
 void kernel_entry(void);
+void yield(void);
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3,
                         long arg4, long arg5, long fid, long eid) {
@@ -39,7 +40,8 @@ __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrw sscratch, sp\n" // sscratchレジスタに、例外発生時のスタックポインタを保存
+        // 実行中プロセスのカーネルスタックをsscratchから取り出すj
+        "csrrw sp, sscratch, sp\n" // sscratchレジスタに、例外発生時のスタックポインタを保存
         "addi sp, sp, -4 * 31\n"
         "sw ra,  4 * 0(sp)\n"
         "sw gp,  4 * 1(sp)\n"
@@ -72,8 +74,13 @@ void kernel_entry(void) {
         "sw s10, 4 * 28(sp)\n"
         "sw s11, 4 * 29(sp)\n"
 
+        // 例外発生時のspを取り出して保存
         "csrr a0, sscratch\n"// a0レジスタにスタックポインタをセットし、handle_trap関数を呼び出し
         "sw a0, 4 * 30(sp)\n"
+
+        // カーネルスタックを設定し直す
+        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, a0\n"
 
         "mv a0, sp\n"
         "call handle_trap\n"
@@ -113,6 +120,84 @@ void kernel_entry(void) {
     );
 }
 
+struct process procs[PROCS_MAX];
+
+// コンテキストスイッチ:
+// スタックに呼び出し先保存レジスタを保存し、スタックポインタの保存、復元、呼び出し先保存レジスタを復元する。
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,
+                                           uint32_t *next_sp) {
+    __asm__ __volatile__(
+        "addi sp, sp, -13 * 4\n"
+        "sw ra,  0  * 4(sp)\n"
+        "sw s0,  1  * 4(sp)\n"
+        "sw s1,  2  * 4(sp)\n"
+        "sw s2,  3  * 4(sp)\n"
+        "sw s3,  4  * 4(sp)\n"
+        "sw s4,  5  * 4(sp)\n"
+        "sw s5,  6  * 4(sp)\n"
+        "sw s6,  7  * 4(sp)\n"
+        "sw s7,  8  * 4(sp)\n"
+        "sw s8,  9  * 4(sp)\n"
+        "sw s9,  10 * 4(sp)\n"
+        "sw s10, 11 * 4(sp)\n"
+        "sw s11, 12 * 4(sp)\n"
+        "sw sp, (a0)\n"
+        "lw sp, (a1)\n"
+        "lw ra,  0  * 4(sp)\n"
+        "lw s0,  1  * 4(sp)\n"
+        "lw s1,  2  * 4(sp)\n"
+        "lw s2,  3  * 4(sp)\n"
+        "lw s3,  4  * 4(sp)\n"
+        "lw s4,  5  * 4(sp)\n"
+        "lw s5,  6  * 4(sp)\n"
+        "lw s6,  7  * 4(sp)\n"
+        "lw s7,  8  * 4(sp)\n"
+        "lw s8,  9  * 4(sp)\n"
+        "lw s9,  10 * 4(sp)\n"
+        "lw s10, 11 * 4(sp)\n"
+        "lw s11, 12 * 4(sp)\n"
+        "addi sp, sp, 13 * 4\n"
+        "ret\n"
+    );
+}
+
+// 実行開始アドレス(pc)を受け取り、プロセス管理構造体を初期化して返す
+struct process *create_process(uint32_t pc) {
+    // 空いているプロセス構造体を探す
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slots");
+
+    // switch_context()で復帰できるように、スタックに呼び出し先保存レジスタを積む
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    *--sp = 0;              // s11
+    *--sp = 0;              // s10
+    *--sp = 0;              // s9
+    *--sp = 0;              // s8
+    *--sp = 0;              // s7
+    *--sp = 0;              // s6
+    *--sp = 0;              // s5
+    *--sp = 0;              // s4
+    *--sp = 0;              // s3
+    *--sp = 0;              // s2
+    *--sp = 0;              // s1
+    *--sp = (uint32_t) pc;  // ra
+
+    // 各フィールドを初期化
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    return proc;
+}
+
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause); //scause: 例外の発生事由
     uint32_t stval = READ_CSR(stval);
@@ -137,23 +222,87 @@ paddr_t alloc_pages(uint32_t n) {
     return paddr;
 }
 
+struct process *proc_a;
+struct process *proc_b;
+
+void proc_a_entry(void) {
+    printf("starting process A\n");
+    while (1) {
+        putchar('A');
+        yield();
+
+        for (int i = 0; i < 30000000; i++)
+            __asm__ __volatile__("nop");
+    }
+}
+
+void proc_b_entry(void) {
+    printf("starting process B\n");
+    while (1) {
+        putchar('B');
+        yield();
+
+        for (int i = 0; i < 30000000; i++)
+            __asm__ __volatile__("nop");
+    }
+}
+
+struct process *current_proc; // 現在実行中のプロセス
+struct process *idle_proc;    // アイドルプロセス、実行可能なプロセスがないときに実行される
+
+void yield(void) {
+    // 実行可能なプロセスを探す
+    struct process *next = idle_proc;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
+        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
+            next = proc;
+            break;
+        }
+    }
+    // 現在実行中のプロセス以外に、実行可能なプロセスがない・。戻って処理を実行する。
+    if (next == current_proc)
+        return;
+
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+
+    // コンテキストスイッチ
+    struct process *prev = current_proc;
+    current_proc = next;
+    switch_context(&prev->sp, &next->sp);
+}
+
 void kernel_main(void) {
     printf("\n\nHello %s\n", "World!");
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
-    paddr_t paddr0 = alloc_pages(2);
-    paddr_t paddr1 = alloc_pages(1);
-    printf("alloc_pages test: paddr0=%x\n", paddr0);
-    printf("alloc_pages test: paddr1=%x\n", paddr1);
+    printf("\n\n");
+    /* paddr_t paddr0 = alloc_pages(2); */
+    /* paddr_t paddr1 = alloc_pages(1); */
+    /* printf("alloc_pages test: paddr0=%x\n", paddr0); */
+    /* printf("alloc_pages test: paddr1=%x\n", paddr1); */
 
-    /* WRITE_CSR(stvec, (uint32_t) kernel_entry); */
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
     // CPUが無効な機械語であると判断するようなバイナリを出力してくれる、デバッグ用の機能。 */
     /* __asm__ __volatile__("unimp"); */
+
+    idle_proc = create_process((uint32_t) NULL);
+    idle_proc->pid = -1; // idle
+    current_proc = idle_proc;
+
+    proc_a = create_process((uint32_t) proc_a_entry);
+    proc_b = create_process((uint32_t) proc_b_entry);
+    /* proc_a_entry(); */
+    yield();
+    PANIC("switched to idle process");
 
     /* for (;;){ */
     /*     __asm__ __volatile__("wfi"); */
     /* } */
-    PANIC("booted!");
 }
 
 __attribute__((section(".text.boot")))
