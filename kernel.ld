@@ -3,6 +3,7 @@ ENTRY(boot)
 
 SECTIONS {
   . = 0x80200000; /* ベースアドレスを0x80200000に */
+  __kernel_base = .;
 
   /* .text(コード領域)セクションの配置 */
   .text :{
